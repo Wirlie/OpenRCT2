@@ -20,7 +20,7 @@
 #include "../world/Location.hpp"
 #include "../world/Location.hpp"
 
-#include <openrct2-ui/windows/Window.h>
+#include "../../openrct2-ui/windows/Window.h"
 
 #include "network.h"
 
