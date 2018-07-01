@@ -138,6 +138,8 @@ public:
     void Server_Send_GAME_ACTION(const GameAction *action);
     void Server_Send_TICK();
     void Server_Send_PLAYERLIST();
+    void Server_Send_UPDATE_BALANCE();
+    void Server_Send_UPDATE_CLIMATE(uint16_t  climateUpdateTimer, int8_t temperature, uint8_t weatherGloom, uint8_t weatherEffect, uint8_t rainLevel, uint8_t weather);
     void Client_Send_PING();
     void Server_Send_PING();
     void Server_Send_PINGLIST();
@@ -150,7 +152,8 @@ public:
     void Client_Send_GAMEINFO();
     void Client_Send_OBJECTS(const std::vector<std::string> &objects);
     void Server_Send_OBJECTS(NetworkConnection& connection, const std::vector<const ObjectRepositoryItem *> &objects) const;
-
+    uint16_t Server_Calculate_Most_Laggy_Client();
+    
     std::vector<std::unique_ptr<NetworkPlayer>> player_list;
     std::vector<std::unique_ptr<NetworkGroup>> group_list;
     NetworkKey _key;
@@ -184,16 +187,18 @@ private:
 
     struct GameCommand
     {
-        GameCommand(uint32_t t, uint32_t* args, uint8_t p, uint8_t cb, uint32_t id) {
+        GameCommand(uint32_t t, uint32_t ft, uint32_t* args, uint8_t p, uint8_t cb, uint32_t id) {
             tick = t; eax = args[0]; ebx = args[1]; ecx = args[2]; edx = args[3];
+            futureTickExecution = ft;
             esi = args[4]; edi = args[5]; ebp = args[6]; playerid = p; callback = cb;
             action = nullptr;
             commandIndex = id;
         }
 
-        GameCommand(uint32_t t, std::unique_ptr<GameAction>&& ga, uint32_t id)
+        GameCommand(uint32_t t, uint32_t ft, std::unique_ptr<GameAction>&& ga, uint32_t id)
         {
             tick = t;
+            futureTickExecution = ft;
             action = std::move(ga);
             commandIndex = id;
         }
@@ -202,6 +207,7 @@ private:
         {
         }
 
+        uint32_t futureTickExecution = 0;
         uint32_t tick = 0;
         uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0, esi = 0, edi = 0, ebp = 0;
         GameAction::Ptr action;
@@ -231,6 +237,11 @@ private:
     SOCKET_STATUS _lastConnectStatus = SOCKET_STATUS_CLOSED;
     uint32_t last_tick_sent_time = 0;
     uint32_t last_ping_sent_time = 0;
+    bool send_map_for_resync = false;
+    int16_t resyncLastViewX = 0;
+    int16_t resyncLastViewY = 0;
+    bool resyncView = false;
+    uint32_t last_send_map_time = 0;
     uint32_t server_tick = 0;
     uint32_t server_srand0 = 0;
     uint32_t server_srand0_tick = 0;
@@ -283,6 +294,8 @@ private:
     void Client_Handle_TOKEN(NetworkConnection& connection, NetworkPacket& packet);
     void Server_Handle_TOKEN(NetworkConnection& connection, NetworkPacket& packet);
     void Client_Handle_OBJECTS(NetworkConnection& connection, NetworkPacket& packet);
+    void Client_Handle_UPDATE_BALANCE(NetworkConnection& connection, NetworkPacket& packet);
+    void Client_Handle_UPDATE_CLIMATE(NetworkConnection& connection, NetworkPacket& packet);
     void Server_Handle_OBJECTS(NetworkConnection& connection, NetworkPacket& packet);
 
     uint8_t * save_for_network(size_t &out_size, const std::vector<const ObjectRepositoryItem *> &objects) const;
@@ -347,6 +360,7 @@ void network_send_map();
 void network_send_chat(const char* text);
 void network_send_gamecmd(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx, uint32_t esi, uint32_t edi, uint32_t ebp, uint8_t callback);
 void network_send_game_action(const GameAction *action);
+void network_send_update_climate(uint16_t  climateUpdateTimer, int8_t temperature, uint8_t weatherGloom, uint8_t weatherEffect, uint8_t rainLevel, uint8_t weather);
 void network_enqueue_game_action(const GameAction *action);
 void network_send_password(const char* password);
 

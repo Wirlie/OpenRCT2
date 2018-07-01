@@ -18,6 +18,9 @@
 #include "../platform/platform.h"
 #include "../util/SawyerCoding.h"
 #include "../world/Location.hpp"
+#include "../world/Location.hpp"
+
+#include <openrct2-ui/windows/Window.h>
 
 #include "network.h"
 
@@ -65,6 +68,8 @@ static int32_t _pickup_peep_old_x = LOCATION_NULL;
 #include "../util/Util.h"
 #include "../Cheats.h"
 #include "../world/Park.h"
+#include "../world/Climate.h"
+#include <openrct2/management/Finance.h>
 
 #include "NetworkAction.h"
 
@@ -80,6 +85,7 @@ enum {
 };
 
 void network_chat_show_connected_message();
+void network_chat_show_resync_message();
 void network_chat_show_server_greeting();
 static void network_get_keys_directory(utf8 *buffer, size_t bufferSize);
 static void network_get_private_key_path(utf8 *buffer, size_t bufferSize, const utf8 * playerName);
@@ -111,6 +117,8 @@ Network::Network()
     client_command_handlers[NETWORK_COMMAND_GAMEINFO] = &Network::Client_Handle_GAMEINFO;
     client_command_handlers[NETWORK_COMMAND_TOKEN] = &Network::Client_Handle_TOKEN;
     client_command_handlers[NETWORK_COMMAND_OBJECTS] = &Network::Client_Handle_OBJECTS;
+    client_command_handlers[NETWORK_COMMAND_UPDATE_BALANCE] = &Network::Client_Handle_UPDATE_BALANCE;
+    client_command_handlers[NETWORK_COMMAND_UPDATE_CLIMATE] = &Network::Client_Handle_UPDATE_CLIMATE;
     server_command_handlers.resize(NETWORK_COMMAND_MAX, nullptr);
     server_command_handlers[NETWORK_COMMAND_AUTH] = &Network::Server_Handle_AUTH;
     server_command_handlers[NETWORK_COMMAND_CHAT] = &Network::Server_Handle_CHAT;
@@ -139,6 +147,8 @@ void Network::SetEnvironment(const std::shared_ptr<IPlatformEnvironment>& env)
 
 bool Network::Init()
 {
+    resyncView = false;
+
     if (!InitialiseWSA()) {
         return false;
     }
@@ -452,6 +462,21 @@ void Network::UpdateServer()
     if (ticks > last_ping_sent_time + 3000) {
         Server_Send_PING();
         Server_Send_PINGLIST();
+        Server_Send_UPDATE_BALANCE();
+    }
+
+    if (last_send_map_time == 0)
+    {
+        last_send_map_time = ticks;
+    }
+    else if (ticks > last_send_map_time + 300000)
+    {
+        last_send_map_time = ticks;
+        
+        log_info("Enviando mapa para resincronizar ...");
+        send_map_for_resync = true;
+        network_send_map();
+        send_map_for_resync = false;
     }
 
     if (_advertiser != nullptr) {
@@ -1114,7 +1139,7 @@ void Network::Server_Send_MAP(NetworkConnection* connection)
     for (size_t i = 0; i < out_size; i += chunksize) {
         size_t datasize = std::min(chunksize, out_size - i);
         std::unique_ptr<NetworkPacket> packet(NetworkPacket::Allocate());
-        *packet << (uint32_t)NETWORK_COMMAND_MAP << (uint32_t)out_size << (uint32_t)i;
+        *packet << (uint32_t)NETWORK_COMMAND_MAP << send_map_for_resync << (uint32_t)out_size << (uint32_t)i;
         packet->Write(&header[i], datasize);
         if (connection) {
             connection->QueuePacket(std::move(packet));
@@ -1274,6 +1299,20 @@ void Network::Server_Send_PLAYERLIST()
         player->Write(*packet);
     }
     SendPacketToClients(*packet);
+}
+
+void Network::Server_Send_UPDATE_BALANCE()
+{
+    std::unique_ptr<NetworkPacket> packet(NetworkPacket::Allocate());
+    *packet << (uint32_t)NETWORK_COMMAND_UPDATE_BALANCE << gCash;
+    SendPacketToClients(*packet);
+}
+
+void Network::Server_Send_UPDATE_CLIMATE(uint16_t  climateUpdateTimer, int8_t temperature, uint8_t weatherGloom, uint8_t weatherEffect, uint8_t rainLevel, uint8_t weather) {
+    std::unique_ptr<NetworkPacket> packet(NetworkPacket::Allocate());
+    *packet << (uint32_t)NETWORK_COMMAND_UPDATE_CLIMATE << climateUpdateTimer << temperature << weatherGloom << weatherEffect << rainLevel << weather;
+    SendPacketToClients(*packet);
+    log_info("SEND UPDATE CLIMATE() TO CLIENTS");
 }
 
 void Network::Client_Send_PING()
@@ -1461,12 +1500,13 @@ void Network::ProcessGameCommandQueue()
             }
 
             // exit the game command processing loop to still have a chance at finding desync.
-            if (game_command_queue.begin()->tick != gCurrentTicks)
+            if (game_command_queue.begin()->tick != gCurrentTicks) {
+                log_verbose("Game Command Loop Break, begin().tick = %u, current = %u", game_command_queue.begin()->tick, gCurrentTicks);
                 break;
+            }
         }
 
         if (gc.action != nullptr) {
-
             GameAction *action = gc.action.get();
             action->SetFlags(action->GetFlags() | GAME_COMMAND_FLAG_NETWORKED);
 
@@ -1505,7 +1545,6 @@ void Network::ProcessGameCommandQueue()
                 player->AddMoneySpent(cost);
 
                 if (mode == NETWORK_MODE_SERVER) {
-
                     if (command == GAME_COMMAND_PLACE_SCENERY) {
                         player->LastPlaceSceneryTime = player->LastActionTime;
                     }
@@ -1534,7 +1573,14 @@ void Network::EnqueueGameAction(const GameAction *action)
     DataSerialiser dsIn(false, stream);
     ga->Serialise(dsIn);
 
-    game_command_queue.emplace(gCurrentTicks, std::move(ga), _commandId++);
+    uint32_t futureTickExecution = 0;
+
+    if (mode == NETWORK_MODE_SERVER) {
+        futureTickExecution = gCurrentTicks + Server_Calculate_Most_Laggy_Client();
+        log_info("Enqueue Game Action, future tick execution: %u , current: %u", futureTickExecution, gCurrentTicks);
+    }
+
+    game_command_queue.emplace(gCurrentTicks, futureTickExecution, std::move(ga), _commandId++);
 }
 
 void Network::AddClient(ITcpSocket * socket)
@@ -1838,6 +1884,31 @@ void Network::Client_Handle_OBJECTS(NetworkConnection& connection, NetworkPacket
     Client_Send_OBJECTS(requested_objects);
 }
 
+void Network::Client_Handle_UPDATE_BALANCE(NetworkConnection& connection, NetworkPacket& packet)
+{
+    money32 balance;
+    packet >> balance;
+    gCash = balance;
+}
+
+void Network::Client_Handle_UPDATE_CLIMATE(NetworkConnection& connection, NetworkPacket& packet)
+{
+    log_info("UPDATE CLIMATE() HANDLED FROM SERVER");
+
+    uint16_t climateUpdateTimer;
+    int8_t temperature;
+    uint8_t weatherGloom, weatherEffect, rainLevel, weather;
+
+    packet >> climateUpdateTimer >> temperature >> weatherGloom >> weatherEffect >> rainLevel >> weather;
+
+    gClimateUpdateTimer = climateUpdateTimer;
+    gClimateNext.Temperature = temperature;
+    gClimateNext.WeatherGloom = weatherGloom;
+    gClimateNext.WeatherEffect = weatherEffect;
+    gClimateNext.RainLevel = rainLevel;
+    gClimateNext.Weather = weather;
+}
+
 void Network::Server_Handle_OBJECTS(NetworkConnection& connection, NetworkPacket& packet)
 {
     uint32_t size;
@@ -1970,8 +2041,20 @@ void Network::Server_Handle_AUTH(NetworkConnection& connection, NetworkPacket& p
 
 void Network::Client_Handle_MAP([[maybe_unused]] NetworkConnection& connection, NetworkPacket& packet)
 {
+    bool map_resync;
     uint32_t size, offset;
-    packet >> size >> offset;
+    packet >> map_resync >> size >> offset;
+
+    if (map_resync && !resyncView)
+    {
+        log_info("Client_Handle_MAP() para resincronizar recibido.");
+        resyncView = true;
+        rct_window * window = window_get_main();
+        resyncLastViewX = window->viewport->view_x;
+        resyncLastViewY = window->viewport->view_y;
+        network_chat_show_resync_message();
+    }
+
     int32_t chunksize = (int32_t)(packet.Size - packet.BytesRead);
     if (chunksize <= 0) {
         return;
@@ -1988,9 +2071,11 @@ void Network::Client_Handle_MAP([[maybe_unused]] NetworkConnection& connection, 
     intent.putExtra(INTENT_EXTRA_CALLBACK, []() -> void {
         gNetwork.Close();
     });
+
     context_open_intent(&intent);
 
     memcpy(&chunk_buffer[offset], (void*)packet.Read(chunksize), chunksize);
+
     if (offset + chunksize == size) {
         context_force_close_window_by_class(WC_NETWORK_STATUS);
         bool has_to_free = false;
@@ -2025,7 +2110,19 @@ void Network::Client_Handle_MAP([[maybe_unused]] NetworkConnection& connection, 
             gFirstTimeSaving = true;
 
             // Notify user he is now online and which shortcut key enables chat
-            network_chat_show_connected_message();
+            if (!map_resync)
+            {
+                network_chat_show_connected_message();
+            }
+            else
+            {
+                resyncView = false;
+                rct_window * window = window_get_main();
+                window->saved_view_x = resyncLastViewX;
+                window->viewport->view_x = resyncLastViewX;
+                window->saved_view_y = resyncLastViewY;
+                window->viewport->view_y = resyncLastViewY;
+            }
 
             // Fix invalid vehicle sprite sizes, thus preventing visual corruption of sprites
             fix_invalid_vehicle_sprite_sizes();
@@ -2173,7 +2270,7 @@ void Network::Client_Handle_GAMECMD([[maybe_unused]] NetworkConnection& connecti
     uint8_t callback;
     packet >> tick >> args[0] >> args[1] >> args[2] >> args[3] >> args[4] >> args[5] >> args[6] >> playerid >> callback;
 
-    game_command_queue.emplace(tick, args, playerid, callback, _commandId++);
+    game_command_queue.emplace(tick, 0, args, playerid, callback, _commandId++);
 }
 
 void Network::Client_Handle_GAME_ACTION([[maybe_unused]] NetworkConnection& connection, NetworkPacket& packet)
@@ -2209,7 +2306,7 @@ void Network::Client_Handle_GAME_ACTION([[maybe_unused]] NetworkConnection& conn
         }
     }
 
-    game_command_queue.emplace(tick, std::move(action), _commandId++);
+    game_command_queue.emplace(tick, 0, std::move(action), _commandId++);
 }
 
 void Network::Server_Handle_GAME_ACTION(NetworkConnection& connection, NetworkPacket& packet)
@@ -2282,7 +2379,12 @@ void Network::Server_Handle_GAME_ACTION(NetworkConnection& connection, NetworkPa
     // Set player to sender, should be 0 if sent from client.
     ga->SetPlayer(connection.Player->Id);
 
-    game_command_queue.emplace(tick, std::move(ga), _commandId++);
+    uint32_t futureTickExecution = 0;
+
+    futureTickExecution = gCurrentTicks + Server_Calculate_Most_Laggy_Client();
+    log_info("Enqueue Game Action, future tick execution: %u , current: %u", futureTickExecution, gCurrentTicks);
+
+    game_command_queue.emplace(tick, futureTickExecution, std::move(ga), _commandId++);
 }
 
 void Network::Server_Handle_GAMECMD(NetworkConnection& connection, NetworkPacket& packet)
@@ -2345,7 +2447,12 @@ void Network::Server_Handle_GAMECMD(NetworkConnection& connection, NetworkPacket
         return;
     }
 
-    game_command_queue.emplace(tick, args, playerid, callback, _commandId++);
+    uint16_t futureTickExecution = 0;
+
+    futureTickExecution = gCurrentTicks + Server_Calculate_Most_Laggy_Client();
+    log_info("Enqueue Game CMD, future tick execution: %u , current: %u", futureTickExecution, gCurrentTicks);
+
+    game_command_queue.emplace(tick, futureTickExecution, args, playerid, callback, _commandId++);
 }
 
 void Network::Client_Handle_TICK([[maybe_unused]] NetworkConnection& connection, NetworkPacket& packet)
@@ -2535,6 +2642,25 @@ void Network::Client_Handle_GAMEINFO([[maybe_unused]] NetworkConnection& connect
     json_decref(root);
 
     network_chat_show_server_greeting();
+}
+
+uint16_t Network::Server_Calculate_Most_Laggy_Client()
+{
+    uint32_t mostLaggyClient = 0;
+
+    for (const auto &player : player_list) {
+        if (player->Ping > mostLaggyClient) {
+            mostLaggyClient = player->Ping;
+        }
+    }
+
+    log_info("Most laggy client = %u", mostLaggyClient);
+
+    mostLaggyClient *= 3;
+
+    log_info("conversion x3 = %u", mostLaggyClient);
+
+    return mostLaggyClient;
 }
 
 void network_set_env(const std::shared_ptr<IPlatformEnvironment>& env)
@@ -2733,6 +2859,14 @@ void network_chat_show_connected_message()
     NetworkPlayer server;
     server.Name = "Server";
     const char * formatted = Network::FormatChat(&server, buffer);
+    chat_history_add(formatted);
+}
+
+void network_chat_show_resync_message()
+{
+    NetworkPlayer server;
+    server.Name = "Server";
+    const char * formatted = Network::FormatChat(&server, "Resincronizando ...");
     chat_history_add(formatted);
 }
 
@@ -3172,6 +3306,14 @@ void network_send_game_action(const GameAction *action)
     case NETWORK_MODE_CLIENT:
         gNetwork.Client_Send_GAME_ACTION(action);
         break;
+    }
+}
+
+void network_send_update_climate(uint16_t  climateUpdateTimer, int8_t temperature, uint8_t weatherGloom, uint8_t weatherEffect, uint8_t rainLevel, uint8_t weather)
+{
+    if (gNetwork.GetMode() == NETWORK_MODE_SERVER)
+    {
+        gNetwork.Server_Send_UPDATE_CLIMATE(climateUpdateTimer, temperature, weatherGloom, weatherEffect, rainLevel, weather);
     }
 }
 

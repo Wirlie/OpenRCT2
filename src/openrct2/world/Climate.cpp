@@ -24,6 +24,8 @@
 #include "Climate.h"
 #include "../windows/Intent.h"
 #include "../Context.h"
+#include "../Context.h"
+#include "../network/network.h"
 
 constexpr int32_t MAX_THUNDER_INSTANCES = 2;
 
@@ -120,6 +122,7 @@ void climate_update()
                 auto intent = Intent(INTENT_ACTION_UPDATE_CLIMATE);
                 context_broadcast_intent(&intent);
             }
+
             gClimateUpdateTimer--;
         }
         else if (!(gCurrentTicks & 0x7F))
@@ -157,7 +160,6 @@ void climate_update()
                 context_broadcast_intent(&intent);
             }
         }
-
     }
 
     if (_thunderTimer != 0)
@@ -165,6 +167,7 @@ void climate_update()
         climate_update_lightning();
         climate_update_thunder();
     }
+
     else if (gClimateCurrent.WeatherEffect == WEATHER_EFFECT_STORM)
     {
         // Create new thunder and lightning
@@ -265,6 +268,8 @@ static void climate_determine_future_weather(int32_t randomDistribution)
     gClimateNext.RainLevel = nextWeatherState->RainLevel;
 
     gClimateUpdateTimer = 1920;
+
+    //network_send_update_climate(gClimateUpdateTimer, gClimateCurrent.Temperature, gClimateCurrent.WeatherGloom, gClimateCurrent.WeatherEffect, gClimateCurrent.RainLevel, gClimateCurrent.Weather);
 }
 
 static void climate_update_rain_sound()
